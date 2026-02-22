@@ -14,17 +14,18 @@ app.use(express.json());
 const UPLOAD_DIR = '/tmp/uploads';
 const OUTPUT_DIR = '/tmp/outputs';
 
-[UPLOAD_DIR, OUTPUT_DIR].forEach(dir => {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-});
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
 const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
-  filename: (req, file, cb) => cb(null, file.originalname)
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+    filename: (req, file, cb) => cb(null, file.originalname)
+  }),
+  limits: { fileSize: 500 * 1024 * 1024 }
 });
-const upload = multer({ storage, limits: { fileSize: 500 * 1024 * 1024 } });
 
 const jobs = {};
 
@@ -33,70 +34,97 @@ app.get('/health', (req, res) => {
 });
 
 app.post('/upload', upload.array('files'), (req, res) => {
-  try {
-    const labels = JSON.parse(req.body.labels || '{}');
-    const jobId = crypto.randomUUID();
-    jobs[jobId] = { labels, status: 'aguardando', videos: [] };
-    console.log('Upload recebido, jobId:', jobId, 'arquivos:', req.files.map(f => f.originalname));
-    res.json({ jobId, sucesso: true });
-  } catch (err) {
-    console.error('Erro no upload:', err);
-    res.status(500).json({ erro: err.message });
-  }
+  const labels = JSON.parse(req.body.labels || '{}');
+  const jobId = crypto.randomUUID();
+  jobs[jobId] = { labels, status: 'aguardando', videos: [] };
+  res.json({ jobId, sucesso: true });
 });
 
-app.post('/gerar', async (req, res) => {
-  try {
-    const { projectName, format, combinations, jobId: uploadJobId } = req.body;
-    const jobId = uploadJobId || crypto.randomUUID();
-    const jobDir = path.join(OUTPUT_DIR, jobId);
-    fs.mkdirSync(jobDir, { recursive: true });
+app.post('/gerar', (req, res) => {
+  const { projectName, combinations, jobId: uploadJobId } = req.body;
+  const jobId = uploadJobId || crypto.randomUUID();
+  const jobDir = path.join(OUTPUT_DIR, jobId);
+  fs.mkdirSync(jobDir, { recursive: true });
 
-    if (!jobs[jobId]) jobs[jobId] = { videos: [] };
-    jobs[jobId].status = 'processando';
-    jobs[jobId].progresso = 0;
-    jobs[jobId].variacaoAtual = 0;
-    jobs[jobId].total = combinations.length;
-    jobs[jobId].videos = [];
+  if (!jobs[jobId]) jobs[jobId] = {};
+  jobs[jobId].status = 'processando';
+  jobs[jobId].progresso = 0;
+  jobs[jobId].variacaoAtual = 0;
+  jobs[jobId].total = combinations.length;
+  jobs[jobId].videos = [];
 
-    res.json({ jobId });
+  res.json({ jobId });
 
-    (async () => {
-      for (let i = 0; i < combinations.length; i++) {
-        const { gancho, corpo, cta } = combinations[i];
-        const date = new Date().toISOString().split('T')[0].replace(/-/g, '');
-        const outputName = `${projectName}_G${i+1}xC${i+1}xCTA${i+1}_${date}.mp4`;
-        const outputPath = path.join(jobDir, outputName);
-        const listPath = path.join(jobDir, `list_${i}.txt`);
+  let i = 0;
 
-        const fileList = [gancho, corpo, cta]
-          .map(f => `file '${path.join(UPLOAD_DIR, f)}'`)
-          .join('\n');
-        fs.writeFileSync(listPath, fileList);
+  function processNext() {
+    if (i >= combinations.length) {
+      const zipName = projectName + '_todas.zip';
+      const zipPath = path.join(jobDir, zipName);
+      const output = fs.createWriteStream(zipPath);
+      const archive = archiver('zip');
+      output.on('close', function() {
+        jobs[jobId].status = 'concluido';
+        jobs[jobId].zipUrl = '/download/' + jobId + '/' + zipName;
+      });
+      archive.pipe(output);
+      jobs[jobId].videos.forEach(function(v) {
+        archive.file(path.join(jobDir, v.nome), { name: v.nome });
+      });
+      archive.finalize();
+      return;
+    }
 
-        console.log(`Processando variação ${i+1}/${combinations.length}: ${gancho} + ${corpo} + ${cta}`);
+    const combo = combinations[i];
+    const date = new Date().toISOString().split('T')[0].replace(/-/g, '');
+    const outputName = projectName + '_G' + (i+1) + 'xC' + (i+1) + 'xCTA' + (i+1) + '_' + date + '.mp4';
+    const outputPath = path.join(jobDir, outputName);
+    const listPath = path.join(jobDir, 'list_' + i + '.txt');
 
-        await new Promise((resolve, reject) => {
-          const cmd = `"${ffmpegPath}" -f concat -safe 0 -i "${listPath}" -c copy "${outputPath}"`;
-          exec(cmd, (error, stdout, stderr) => {
-            if (error) { console.error('Erro FFmpeg:', stderr); reject(error); }
-            else resolve();
-          });
-        });
+    const fileList = [combo.gancho, combo.corpo, combo.cta]
+      .map(function(f) { return "file '" + path.join(UPLOAD_DIR, f) + "'"; })
+      .join('\n');
+    fs.writeFileSync(listPath, fileList);
 
+    const cmd = '"' + ffmpegPath + '" -f concat -safe 0 -i "' + listPath + '" -c copy "' + outputPath + '"';
+    exec(cmd, function(error) {
+      if (!error) {
         jobs[jobId].videos.push({
           nome: outputName,
-          composicao: `${gancho} + ${corpo} + ${cta}`,
+          composicao: combo.gancho + ' + ' + combo.corpo + ' + ' + combo.cta,
           duracao: 0,
-          downloadUrl: `/download/${jobId}/${outputName}`
+          downloadUrl: '/download/' + jobId + '/' + outputName
         });
-
-        jobs[jobId].variacaoAtual = i + 1;
-        jobs[jobId].progresso = Math.round(((i + 1) / combinations.length) * 100);
       }
+      jobs[jobId].variacaoAtual = i + 1;
+      jobs[jobId].progresso = Math.round(((i + 1) / combinations.length) * 100);
+      i++;
+      processNext();
+    });
+  }
 
-      const zipName = `${projectName}_todas.zip`;
-      const zipPath = path.join(jobDir, zipName);
-      await new Promise((resolve, reject) => {
-        const output = fs.createWriteStream(zipPath);
-        const archive = archiver('zip');
+  processNext();
+});
+
+app.get('/status/:jobId', (req, res) => {
+  const job = jobs[req.params.jobId];
+  if (!job) return res.status(404).json({ erro: 'Job não encontrado' });
+  res.json({ status: job.status, progresso: job.progresso, variacaoAtual: job.variacaoAtual, total: job.total });
+});
+
+app.get('/resultados/:jobId', (req, res) => {
+  const job = jobs[req.params.jobId];
+  if (!job) return res.status(404).json({ erro: 'Job não encontrado' });
+  res.json({ videos: job.videos, zipUrl: job.zipUrl });
+});
+
+app.get('/download/:jobId/:filename', (req, res) => {
+  const filePath = path.join(OUTPUT_DIR, req.params.jobId, req.params.filename);
+  if (!fs.existsSync(filePath)) return res.status(404).json({ erro: 'Arquivo não encontrado' });
+  res.download(filePath);
+});
+
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, function() {
+  console.log('Servidor rodando na porta ' + PORT);
+});
